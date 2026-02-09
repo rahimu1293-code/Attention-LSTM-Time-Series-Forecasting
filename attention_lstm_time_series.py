@@ -1,73 +1,54 @@
+"""
+Advanced Time Series Forecasting with Attention
+Corrected as per reviewer feedback
+"""
+
 import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-import time
-
-from sklearn.preprocessing import MinMaxScaler
-from sklearn.metrics import mean_squared_error, mean_absolute_error
-
 import tensorflow as tf
+import matplotlib.pyplot as plt
+from tensorflow.keras.layers import LSTM, Dense, Input
 from tensorflow.keras.models import Model
-from tensorflow.keras.layers import Input, LSTM, Dense, Layer
 from tensorflow.keras.optimizers import Adam
-
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.metrics import mean_squared_error
 from statsmodels.tsa.statespace.sarimax import SARIMAX
+import warnings
+warnings.filterwarnings("ignore")
 
-# ============================================================
-# 1. Synthetic Time Series Data Generation
-# ============================================================
+# --------------------------------------------------
+# 1. DATA GENERATION 
+# --------------------------------------------------
+def generate_time_series(n_points=2500):
+    """
+    Generates complex synthetic time series with multiple seasonality.
+    """
+    t = np.arange(n_points)
+    season1 = 10 * np.sin(2 * np.pi * t / 24)
+    season2 = 5 * np.sin(2 * np.pi * t / 365)
+    trend = 0.01 * t
+    noise = np.random.normal(0, 2, n_points)
+    return season1 + season2 + trend + noise
 
-np.random.seed(42)
 
-n = 2500  # > 2000 observations
-t = np.arange(n)
-
-trend = 0.005 * t
-seasonal_1 = 2 * np.sin(2 * np.pi * t / 24)      # Daily cycle
-seasonal_2 = 1.5 * np.sin(2 * np.pi * t / 168)   # Weekly cycle
-noise = np.random.normal(0, 0.5, n)
-
-series = trend + seasonal_1 + seasonal_2 + noise
-data = pd.DataFrame({"value": series})
-
-plt.figure()
-plt.plot(series)
-plt.title("Synthetic Time Series")
-plt.show()
-
-# ============================================================
-# Data Preparation
-# ============================================================
-
-scaler = MinMaxScaler()
-scaled_series = scaler.fit_transform(series.reshape(-1, 1))
-
-def create_sequences(data, window=30):
+# --------------------------------------------------
+# 2. SEQUENCE CREATION
+# --------------------------------------------------
+def create_sequences(series, window=30):
     X, y = [], []
-    for i in range(len(data) - window):
-        X.append(data[i:i+window])
-        y.append(data[i+window])
+    for i in range(len(series) - window):
+        X.append(series[i:i+window])
+        y.append(series[i+window])
     return np.array(X), np.array(y)
 
-window_size = 30
-X, y = create_sequences(scaled_series, window_size)
 
-split = int(0.8 * len(X))
-X_train, X_test = X[:split], X[split:]
-y_train, y_test = y[:split], y[split:]
-
-# ============================================================
-# 2. Custom Attention Layer
-# ============================================================
-
-class Attention(Layer):
-    def _init_(self):
-        super(Attention, self)._init_()
-
+# --------------------------------------------------
+# 3. CUSTOM ATTENTION 
+# --------------------------------------------------
+class Attention(tf.keras.layers.Layer):
     def build(self, input_shape):
         self.W = self.add_weight(
             shape=(input_shape[-1], 1),
-            initializer="random_normal",
+            initializer="glorot_uniform",
             trainable=True
         )
         self.b = self.add_weight(
@@ -78,110 +59,152 @@ class Attention(Layer):
 
     def call(self, inputs):
         score = tf.nn.tanh(tf.matmul(inputs, self.W) + self.b)
-        attention_weights = tf.nn.softmax(score, axis=1)
-        context_vector = attention_weights * inputs
-        context_vector = tf.reduce_sum(context_vector, axis=1)
-        return context_vector, attention_weights
+        weights = tf.nn.softmax(score, axis=1)
+        self.attention_weights = weights
+        return tf.reduce_sum(inputs * weights, axis=1)
 
-# ============================================================
-# Attention-LSTM Model
-# ============================================================
 
-def build_attention_lstm(lr=0.001, units=64):
-    inputs = Input(shape=(window_size, 1))
-    lstm_out = LSTM(units, return_sequences=True)(inputs)
-    context, attention_weights = Attention()(lstm_out)
-    output = Dense(1)(context)
-
-    model = Model(inputs, output)
-    model.compile(
-        optimizer=Adam(learning_rate=lr),
-        loss="mse"
-    )
+# --------------------------------------------------
+# 4. MODEL
+# --------------------------------------------------
+def build_model(units, lr, window):
+    inputs = Input(shape=(window, 1))
+    x = LSTM(units, return_sequences=True)(inputs)
+    att = Attention()(x)
+    out = Dense(1)(att)
+    model = Model(inputs, out)
+    model.compile(optimizer=Adam(lr), loss="mse")
     return model
 
-# ============================================================
-# 3. Rolling Forecast Cross-Validation
-# ============================================================
 
-learning_rates = [0.001, 0.0005]
-lstm_units = [32, 64]
+# --------------------------------------------------
+# 5. DATA SPLIT 
+# --------------------------------------------------
+series = generate_time_series()
+window = 30
+X, y = create_sequences(series, window)
+X = X[..., np.newaxis]
 
-best_rmse = np.inf
-best_model = None
+train_size = int(0.7 * len(X))
+val_size = int(0.15 * len(X))
 
-for lr in learning_rates:
-    for units in lstm_units:
-        model = build_attention_lstm(lr, units)
-        model.fit(
-            X_train, y_train,
-            epochs=5,
-            batch_size=32,
-            verbose=0
-        )
-        preds = model.predict(X_test)
-        rmse = np.sqrt(mean_squared_error(y_test, preds))
+X_train, y_train = X[:train_size], y[:train_size]
+X_val, y_val = X[train_size:train_size+val_size], y[train_size:train_size+val_size]
+X_test, y_test = X[train_size+val_size:], y[train_size+val_size:]
 
-        if rmse < best_rmse:
-            best_rmse = rmse
-            best_model = model
 
-print("Best Attention-LSTM RMSE:", best_rmse)
+# --------------------------------------------------
+# 6. HYPERPARAMETER TUNING
+# --------------------------------------------------
+units_list = [32, 64, 128]
+lr_list = [0.001, 0.0005]
+results = {}
 
-# ============================================================
-# 4. Benchmark Model – SARIMAX
-# ================================================
+for u in units_list:
+    for lr in lr_list:
+        model = build_model(u, lr, window)
+        model.fit(X_train, y_train, epochs=10, verbose=0)
+        preds = model.predict(X_val, verbose=0)
+        rmse = np.sqrt(mean_squared_error(y_val, preds))
+        results[(u, lr)] = rmse
 
-train_series = series[:split + window_size]
-test_series = series[split + window_size:]
-
-start_time = time.time()
-sarimax = SARIMAX(
-    train_series,
-    order=(2,1,2),
-    seasonal_order=(1,1,1,24)
-)
-sarimax_fit = sarimax.fit(disp=False)
-sarimax_time = time.time() - start_time
-
-sarimax_pred = sarimax_fit.forecast(len(test_series))
-
-# ============================================================
-# Evaluation Metrics
-# ============================================================
-
-def evaluate(true, pred):
-    rmse = np.sqrt(mean_squared_error(true, pred))
-    mae = mean_absolute_error(true, pred)
-    mape = np.mean(np.abs((true - pred) / true)) * 100
-    return rmse, mae, mape
-
-# Attention-LSTM predictions
-lstm_pred = best_model.predict(X_test)
-lstm_pred = scaler.inverse_transform(lstm_pred)
-y_true = scaler.inverse_transform(y_test)
-
-lstm_rmse, lstm_mae, lstm_mape = evaluate(y_true, lstm_pred)
-sar_rmse, sar_mae, sar_mape = evaluate(test_series, sarimax_pred)
-
-print("\n--- Model Comparison ---")
-print("Attention-LSTM -> RMSE:", lstm_rmse, "MAE:", lstm_mae, "MAPE:", lstm_mape)
-print("SARIMAX        -> RMSE:", sar_rmse, "MAE:", sar_mae, "MAPE:", sar_mape)
-
-# ============================================================
-# 5. Attention Weights Visualization
-# ============================================================
-
-attention_extractor = Model(
-    inputs=best_model.input,
-    outputs=best_model.layers[2].output
-)
-
-_, attention_weights = attention_extractor.predict(X_test[:1])
-
+# Visualization
 plt.figure()
-plt.bar(range(window_size), attention_weights.flatten())
-plt.title("Attention Weights Over Time Steps")
-plt.xlabel("Lag")
+plt.plot([str(k) for k in results.keys()], results.values(), marker="o")
+plt.xticks(rotation=45)
+plt.title("Hyperparameter Tuning RMSE")
+plt.ylabel("RMSE")
+plt.show()
+
+best_units, best_lr = min(results, key=results.get)
+
+
+# --------------------------------------------------
+# 7. FINAL DL MODEL (TRAIN+VAL ONLY)
+# --------------------------------------------------
+final_model = build_model(best_units, best_lr, window)
+final_model.fit(
+    np.vstack([X_train, X_val]),
+    np.hstack([y_train, y_val]),
+    epochs=20,
+    verbose=0
+)
+dl_preds = final_model.predict(X_test, verbose=0)
+dl_rmse = np.sqrt(mean_squared_error(y_test, dl_preds))
+
+
+# --------------------------------------------------
+# 8. ATTENTION WEIGHT VISUALIZATION 
+# --------------------------------------------------
+class Attention(tf.keras.layers.Layer):
+    def build(self, input_shape):
+        self.W = self.add_weight(
+            shape=(input_shape[-1], 1),
+            initializer="glorot_uniform",
+            trainable=True
+        )
+        self.b = self.add_weight(
+            shape=(input_shape[1], 1),
+            initializer="zeros",
+            trainable=True
+        )
+
+    def call(self, inputs, return_attention=False):
+        score = tf.nn.tanh(tf.matmul(inputs, self.W) + self.b)
+        weights = tf.nn.softmax(score, axis=1)
+        context = tf.reduce_sum(inputs * weights, axis=1)
+        if return_attention:
+            return context, weights
+        return context
+
+# Build a temporary model that outputs both prediction and weights
+inputs = tf.keras.Input(shape=(window, 1))
+x = LSTM(best_units, return_sequences=True)(inputs)
+att, weights = Attention()(x, return_attention=True)
+out = Dense(1)(att)
+temp_model = tf.keras.Model(inputs, [out, weights])
+
+# Run prediction
+preds, att_weights = temp_model.predict(X_test[:1])
+
+# Plot weights
+plt.plot(att_weights.flatten())
+plt.title("Attention Weights Across Time Steps")
+plt.xlabel("Time Step")
 plt.ylabel("Importance")
 plt.show()
+
+# --------------------------------------------------
+# 9. SARIMAX TUNING
+# --------------------------------------------------
+best_sarimax_rmse = float("inf")
+
+for order in [(1,1,1), (2,1,1)]:
+    model = SARIMAX(series[:train_size], order=order)
+    fit = model.fit(disp=False)
+    forecast = fit.forecast(len(series[train_size:train_size+val_size]))
+    rmse = np.sqrt(mean_squared_error(
+        series[train_size:train_size+val_size],
+        forecast
+    ))
+    if rmse < best_sarimax_rmse:
+        best_sarimax_rmse = rmse
+        best_order = order
+
+
+sarimax = SARIMAX(series[:train_size+val_size], order=best_order)
+sarimax_fit = sarimax.fit(disp=False)
+sarimax_preds = sarimax_fit.forecast(len(y_test))
+sarimax_rmse = np.sqrt(mean_squared_error(y_test, sarimax_preds))
+
+
+# --------------------------------------------------
+# 10. FINAL REPORT
+# --------------------------------------------------
+print(f"""
+FINAL TEST RESULTS (HELD-OUT SET)
+
+LSTM + Attention RMSE : {dl_rmse:.3f}
+SARIMAX RMSE : {sarimax_rmse:.3f}
+Best SARIMAX Order : {best_order}
+""")
